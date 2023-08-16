@@ -307,7 +307,7 @@ class DT:
         self.D = FastGeodis.generalised_geodesic3d(
             image_pts, pts_mask, [1./self.grid_factor, 1./self.grid_factor, 1./self.grid_factor], 1e10, 0.0, iterations
         ).squeeze()
-            
+        
     def torch_bilinear_distance(self, Y):
         H, W, D = self.D.size()
         target = self.D[None, None, ...]
@@ -530,6 +530,7 @@ def solver(
     
     # NOTE: visualization
     if options.visualize:
+        # loss 曲线
         fig = plt.figure(figsize=(13, 5))
         ax = fig.gca()
         ax.plot(total_losses, label="loss")
@@ -655,6 +656,7 @@ if __name__ == "__main__":
         logging.info(key+': '+str(print_options[key]))
     logging.info('---------------------------------------')
 
+    # 固定种子
     torch.backends.cudnn.deterministic = True
     torch.manual_seed(options.seed)
     if 'cuda' in options.device:
