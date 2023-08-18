@@ -83,6 +83,11 @@ class SemKITTI_sk_multiscan(Dataset):
         return poses
 
     def fuse_multi_scan(self, points, pose0, pose):
+        """
+        points: t - 1
+        pose0: t
+        pose: t - 1
+        """
         hpoints = np.hstack((points[:, :3], np.ones_like(points[:, :1])))
         new_points = np.sum(np.expand_dims(hpoints, 2) * pose.T, axis=1)
 
@@ -107,7 +112,7 @@ class SemKITTI_sk_multiscan(Dataset):
             newpath2 = cur_data_path[:-10] + str(number_idx + 1).zfill(6) + cur_data_path[-4:]
             raw_data2 = np.fromfile(newpath2, dtype=np.float32).reshape((-1, 4))[:, 0:3]
 
-            raw_data = self.fuse_multi_scan(raw_data, pose, pose0)
+            raw_data = self.fuse_multi_scan(raw_data, pose, pose0)   # 当前帧往后一帧对齐
         else:
             raw_data2 = None
         raw_data = raw_data[:, 0:3]
