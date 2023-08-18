@@ -2,8 +2,7 @@
 
 import argparse
 import logging
-import os, glob
-from copy import deepcopy
+import os
 import time
 from collections import defaultdict, namedtuple
 from itertools import accumulate
@@ -17,6 +16,8 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from kitti_dataset import SemKITTI_sk_multiscan
+from tqdm import tqdm
 
 
 # ANCHOR: visualization as in the paper
@@ -144,40 +145,6 @@ def init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
         m.bias.data.fill_(0.0)
-        
-
-# ANCHOR: metrics computation, follow NSFP metrics....
-def scene_flow_metrics(pred, labels):
-    l2_norm = torch.sqrt(torch.sum((pred - labels) ** 2, 2)).cpu()  # Absolute distance error.
-    labels_norm = torch.sqrt(torch.sum(labels * labels, 2)).cpu()
-    relative_err = l2_norm / (labels_norm + 1e-20)
-
-    EPE3D = torch.mean(l2_norm).item()  # Mean absolute distance error
-
-    # NOTE: Acc_5
-    error_lt_5 = torch.BoolTensor((l2_norm < 0.05))
-    relative_err_lt_5 = torch.BoolTensor((relative_err < 0.05))
-    acc3d_strict = torch.mean((error_lt_5 | relative_err_lt_5).float()).item()
-
-    # NOTE: Acc_10
-    error_lt_10 = torch.BoolTensor((l2_norm < 0.1))
-    relative_err_lt_10 = torch.BoolTensor((relative_err < 0.1))
-    acc3d_relax = torch.mean((error_lt_10 | relative_err_lt_10).float()).item()
-
-    # NOTE: outliers
-    l2_norm_gt_3 = torch.BoolTensor(l2_norm > 0.3)
-    relative_err_gt_10 = torch.BoolTensor(relative_err > 0.1)
-    outlier = torch.mean((l2_norm_gt_3 | relative_err_gt_10).float()).item()
-
-    # NOTE: angle error
-    unit_label = labels / labels.norm(dim=2, keepdim=True)
-    unit_pred = pred / pred.norm(dim=2, keepdim=True)
-    eps = 1e-7
-    dot_product = (unit_label * unit_pred).sum(2).clamp(min=-1+eps, max=1-eps)
-    dot_product[dot_product != dot_product] = 0  # Remove NaNs
-    angle_error = torch.acos(dot_product).mean().item()
-
-    return EPE3D, acc3d_strict, acc3d_relax, outlier, angle_error
 
 
 # ANCHOR: timer!
@@ -379,7 +346,6 @@ class Neural_Prior(nn.Module):
 def solver(
     pc1: torch.Tensor,
     pc2: torch.Tensor,
-    flow: torch.Tensor,
     options: argparse.Namespace,
     net: nn.Module,
     max_iters: int
@@ -403,7 +369,6 @@ def solver(
     optimizer = torch.optim.Adam(params, lr=options.lr, weight_decay=0)
                 
     total_losses = []
-    total_acc_strit = []
     total_iter_time = []
     
     if options.earlystopping:
@@ -427,8 +392,7 @@ def solver(
     
     pc1 = pc1.to(options.device).contiguous()
     pc2 = pc2.to(options.device).contiguous()
-    flow = flow.to(options.device).contiguous()
-    print(pc1.shape, pc2.shape, flow.shape)
+    print(pc1.shape, pc2.shape)
     
     pre_compute_time = time.time() - pre_compute_st
     solver_time = solver_time + pre_compute_time
@@ -436,13 +400,7 @@ def solver(
     # ANCHOR: initialize best metrics
     best_loss_1 = 1e10
     best_flow_1 = None
-    best_epe3d_1 = 1.
-    best_acc3d_strict_1 = 0.
-    best_acc3d_relax_1 = 0.
-    best_angle_error_1 = 1.
-    best_outliers_1 = 1.
     best_epoch = 0
-    kdtree_query_time = 0.
     net_time = 0.
     net_backward_time = 0.
     dt_query_time = 0.
@@ -474,30 +432,18 @@ def solver(
         solver_time = solver_time + iter_time
 
         flow_pred_1_final = pc1_deformed - pc1
-        flow_metrics = flow.clone()
-        EPE3D_1, acc3d_strict_1, acc3d_relax_1, outlier_1, angle_error_1 = scene_flow_metrics(flow_pred_1_final, flow_metrics)
 
         # ANCHOR: get best metrics
         if loss <= best_loss_1:
             best_loss_1 = loss.item()
             best_flow_1 = flow_pred_1_final
-            best_epe3d_1 = EPE3D_1
-            best_acc3d_strict_1 = acc3d_strict_1
-            best_acc3d_relax_1 = acc3d_relax_1
-            best_angle_error_1 = angle_error_1
-            best_outliers_1 = outlier_1
             best_epoch = epoch
         
         total_losses.append(loss.item())
-        total_acc_strit.append(acc3d_strict_1)
         total_iter_time.append(time.time()-iter_time_init)
             
         if epoch % 50 == 0:
-            logging.info(f"[Ep {epoch}] [Loss: {loss.item():.5f}] "
-                        f" Metrics: flow 1 --> flow 2"
-                        f" [EPE: {EPE3D_1:.3f}] [Acc strict: {acc3d_strict_1 * 100:.3f}%]"
-                        f" [Acc relax: {acc3d_relax_1 * 100:.3f}%] [Angle error (rad): {angle_error_1:.3f}]"
-                        f" [Outl.: {outlier_1 * 100:.3f}%]")
+            logging.info(f"[Ep {epoch}] [Loss: {loss.item():.5f}]")
     
     if options.time:
         timers.toc("solver_timer")
@@ -508,11 +454,6 @@ def solver(
     info_dict = {
         'final_flow': best_flow_1,
         'loss': best_loss_1,
-        'EPE3D_1': best_epe3d_1,
-        'acc3d_strict_1': best_acc3d_strict_1,
-        'acc3d_relax_1': best_acc3d_relax_1,
-        'angle_error_1': best_angle_error_1,
-        'outlier_1': best_outliers_1,
         'time': time_avg,
         'epoch': best_epoch,
         'solver_time': solver_time,
@@ -539,14 +480,6 @@ def solver(
         ax.set_ylabel("Loss", fontsize="14")
         ax.set_title("Loss vs iterations", fontsize="14")
         plt.show()
-
-        # ANCHOR: new plot style
-        # NOTE: GT flow
-        pc1_o3d_gt = o3d.geometry.PointCloud()
-        colors_flow = flow_to_rgb(flow[0].cpu().numpy().copy())
-        pc1_o3d_gt.points = o3d.utility.Vector3dVector(pc1[0].cpu().numpy().copy())
-        pc1_o3d_gt.colors = o3d.utility.Vector3dVector(colors_flow / 255.0)
-        custom_draw_geometry_with_key_callback([pc1_o3d_gt])  # Press 'k' to see with dark background.
         
         # NOTE: predicted flow
         pc1_o3d_pred = o3d.geometry.PointCloud()
@@ -570,24 +503,20 @@ def optimize_neural_prior(options, data_loader):
     else:
         raise Exception("Model not available.")
     
-    for i in range(len(data_loader)):
-        fi_name = data_loader[i]
-        with open(fi_name, 'rb') as fp:
-            data = np.load(fp)
-            pc1 = torch.from_numpy(data['pc1']).unsqueeze(0)
-            pc2 = torch.from_numpy(data['pc2']).unsqueeze(0)
-            flow = torch.from_numpy(data['flow']).unsqueeze(0)
-            fp.close()
+    for i in tqdm(range(len(data_loader))):
+        pc1, pc2, cur_data_path = data_loader[i]
+        pc1 = torch.from_numpy(pc1).unsqueeze(0)
+        pc2 = torch.from_numpy(pc2).unsqueeze(0)
             
         if not options.use_all_points:
             sample_idx = torch.randperm(min(pc1.shape[1], pc2.shape[1]))[:options.num_points]
             pc1 = pc1[:, sample_idx]
             pc2 = pc2[:, sample_idx]
-            flow = flow[:, sample_idx]
+            # flow = flow[:, sample_idx]
         
-        logging.info(f"# {i} Working on sample: {fi_name}...")
+        logging.info(f"# {i} Working on sample: {cur_data_path}...")
         
-        info_dict = solver(pc1, pc2, flow, options, net, options.iters)
+        info_dict = solver(pc1, pc2, options, net, options.iters)
 
         # Collect results.
         outputs.append(dict(list(info_dict.items())[1:]))
@@ -617,9 +546,6 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=0.001, metavar='LR', help='Learning rate.')
     parser.add_argument('--device', default='cuda:0', type=str, help='device: cpu? cuda?')
     parser.add_argument('--seed', type=int, default=1234, metavar='S', help='Random seed (default: 1234).')
-    parser.add_argument('--dataset', type=str, default='ArgoverseSceneFlowDataset',
-                        choices=['ArgoverseSceneFlowDataset', 'WaymoOpenSceneFlowDataset'], metavar='N', help='Dataset to use.')
-    parser.add_argument('--dataset_path', type=str, default='./dataset/argoverse', metavar='N', help='Dataset path.')
     parser.add_argument('--visualize', action='store_true', default=False, help='Show visuals.')
     parser.add_argument('--time', dest='time', action='store_true', default=True, help='Count the execution time of each step.')
     
@@ -663,9 +589,8 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(options.seed)
     np.random.seed(options.seed)
 
-    if options.dataset == "ArgoverseSceneFlowDataset":
-        data_loader = sorted(glob.glob(f"{options.dataset_path}/val/*/*.npz"))
-    elif options.dataset == 'WaymoOpenSceneFlowDataset':
-        data_loader = sorted(glob.glob(f"{options.dataset_path}/*/*.npz"))
+    for i in range(22):
+        data_loader = SemKITTI_sk_multiscan('/mnt/Disk16T/chenhr/semantic_kitti/sequences/' + str(i).zfill(2))
 
-    optimize_neural_prior(options, data_loader)
+        optimize_neural_prior(options, data_loader)
+        break
