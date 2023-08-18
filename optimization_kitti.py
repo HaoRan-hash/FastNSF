@@ -11,7 +11,7 @@ from typing import Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import FastGeodis
-import open3d as o3d
+# import open3d as o3d
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -89,7 +89,7 @@ def flow_to_rgb(
     (angle_fractional, angle_floor), angle_ceil = np.modf(angle), np.ceil(angle)
     angle_fractional = angle_fractional.reshape((angle_fractional.shape) + (1,))
     float_hue = (
-        wheel[angle_floor.astype(np.int)] * (1 - angle_fractional) + wheel[angle_ceil.astype(np.int)] * angle_fractional
+        wheel[angle_floor.astype(np.int32)] * (1 - angle_fractional) + wheel[angle_ceil.astype(np.int32)] * angle_fractional
     )
     ColorizationArgs = namedtuple(
         'ColorizationArgs', ['move_hue_valid_radius', 'move_hue_oversized_radius', 'invalid_color']
@@ -100,10 +100,10 @@ def flow_to_rgb(
         return 255. - np.expand_dims(factors, -1) * (255. - hues)
     if background == "dark":
         parameters = ColorizationArgs(
-            move_hue_on_V_axis, move_hue_on_S_axis, np.array([255, 255, 255], dtype=np.float)
+            move_hue_on_V_axis, move_hue_on_S_axis, np.array([255, 255, 255], dtype=np.float32)
         )
     else:
-        parameters = ColorizationArgs(move_hue_on_S_axis, move_hue_on_V_axis, np.array([0, 0, 0], dtype=np.float))
+        parameters = ColorizationArgs(move_hue_on_S_axis, move_hue_on_V_axis, np.array([0, 0, 0], dtype=np.float32))
     colors = parameters.move_hue_valid_radius(float_hue, radius)
     oversized_radius_mask = radius > 1
     colors[oversized_radius_mask] = parameters.move_hue_oversized_radius(
@@ -111,34 +111,6 @@ def flow_to_rgb(
         1 / radius[oversized_radius_mask]
     )
     return colors.astype(np.uint8)
-
-
-def custom_draw_geometry_with_key_callback(pcds):
-    def change_background_to_black(vis):
-        opt = vis.get_render_option()
-        opt.background_color = np.asarray([76/255, 86/255, 106/255])
-        # opt.background_color = np.asarray([7/255, 54/255, 66/255])
-        return False
-    def load_render_option(vis):
-        vis.get_render_option().load_from_json(
-            'render_option.json')
-        return False
-    def capture_depth(vis):
-        depth = vis.capture_depth_float_buffer()
-        plt.imshow(np.asarray(depth))
-        plt.show()
-        return False
-    def capture_image(vis):
-        image = vis.capture_screen_float_buffer()
-        plt.imshow(np.asarray(image))
-        plt.show()
-        return False
-    key_to_callback = {}
-    key_to_callback[ord("K")] = change_background_to_black
-    key_to_callback[ord("R")] = load_render_option
-    key_to_callback[ord(",")] = capture_depth
-    key_to_callback[ord(".")] = capture_image
-    o3d.visualization.draw_geometries_with_key_callbacks(pcds, key_to_callback)
     
 
 def init_weights(m):
@@ -472,23 +444,19 @@ def solver(
     # NOTE: visualization
     if options.visualize:
         # loss 曲线
-        fig = plt.figure(figsize=(13, 5))
-        ax = fig.gca()
-        ax.plot(total_losses, label="loss")
-        ax.legend(fontsize="14")
-        ax.set_xlabel("Iteration", fontsize="14")
-        ax.set_ylabel("Loss", fontsize="14")
-        ax.set_title("Loss vs iterations", fontsize="14")
-        plt.show()
+        # fig = plt.figure(figsize=(13, 5))
+        # ax = fig.gca()
+        # ax.plot(total_losses, label="loss")
+        # ax.legend(fontsize="14")
+        # ax.set_xlabel("Iteration", fontsize="14")
+        # ax.set_ylabel("Loss", fontsize="14")
+        # ax.set_title("Loss vs iterations", fontsize="14")
+        # plt.show()
         
         # NOTE: predicted flow
-        pc1_o3d_pred = o3d.geometry.PointCloud()
         colors_flow = flow_to_rgb(info_dict['final_flow'][0].detach().cpu().numpy().copy())
-        pc1_o3d_pred.points = o3d.utility.Vector3dVector(pc1[0].cpu().numpy().copy())
-        pc1_o3d_pred.colors = o3d.utility.Vector3dVector(colors_flow / 255.0)
-        custom_draw_geometry_with_key_callback([pc1_o3d_pred])  # Press 'k' to see with dark background.
     
-    return info_dict
+    return colors_flow, info_dict
 
 
 def optimize_neural_prior(options, data_loader):
@@ -505,6 +473,18 @@ def optimize_neural_prior(options, data_loader):
     
     for i in tqdm(range(len(data_loader))):
         pc1, pc2, cur_data_path = data_loader[i]
+        if pc2 is None:
+            print(i)
+            break
+        
+        red_color = np.zeros_like(pc1)
+        red_color[:, :] = [255, 0, 0]
+        blue_color = np.zeros_like(pc2)
+        blue_color[:, :] = [0, 0, 255]
+        pc1_color = np.concatenate((pc1, red_color), axis=1)
+        pc2_color = np.concatenate((pc2, blue_color), axis=1)
+        pc1_pc2 = np.concatenate((pc1_color, pc2_color), axis=0)
+        
         pc1 = torch.from_numpy(pc1).unsqueeze(0)
         pc2 = torch.from_numpy(pc2).unsqueeze(0)
             
@@ -512,11 +492,16 @@ def optimize_neural_prior(options, data_loader):
             sample_idx = torch.randperm(min(pc1.shape[1], pc2.shape[1]))[:options.num_points]
             pc1 = pc1[:, sample_idx]
             pc2 = pc2[:, sample_idx]
-            # flow = flow[:, sample_idx]
         
         logging.info(f"# {i} Working on sample: {cur_data_path}...")
         
-        info_dict = solver(pc1, pc2, options, net, options.iters)
+        colors_flow, info_dict = solver(pc1, pc2, options, net, options.iters)
+        colors_flow = np.concatenate((pc1.squeeze(dim=0).numpy(), colors_flow), axis=1)
+        
+        if i % 100 == 0:
+            save_path = 'scan_add/00/' + cur_data_path[-10:-4]
+            np.savetxt(save_path + '.txt', pc1_pc2)
+            np.savetxt(save_path + '_flow.txt', colors_flow)
 
         # Collect results.
         outputs.append(dict(list(info_dict.items())[1:]))
@@ -570,11 +555,11 @@ if __name__ == "__main__":
         os.makedirs(exp_dir_path)
 
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s [%(levelname)s] - %(message)s',
         handlers=[logging.FileHandler(filename=f"{exp_dir_path}/run.log"), logging.StreamHandler()])
     logging.info(options)
-    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.INFO)
 
     logging.info('---------------------------------------')
     print_options = vars(options)
