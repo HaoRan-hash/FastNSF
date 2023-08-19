@@ -455,8 +455,9 @@ def solver(
         
         # NOTE: predicted flow
         colors_flow = flow_to_rgb(info_dict['final_flow'][0].detach().cpu().numpy().copy())
+        return colors_flow, info_dict
     
-    return colors_flow, info_dict
+    return info_dict
 
 
 def optimize_neural_prior(options, data_loader):
@@ -474,16 +475,15 @@ def optimize_neural_prior(options, data_loader):
     for i in tqdm(range(len(data_loader))):
         pc1, pc2, cur_data_path = data_loader[i]
         if pc2 is None:
-            print(i)
-            break
+            logging.info(f'{cur_data_path} do not have flow')
         
-        red_color = np.zeros_like(pc1)
-        red_color[:, :] = [255, 0, 0]
-        blue_color = np.zeros_like(pc2)
-        blue_color[:, :] = [0, 0, 255]
-        pc1_color = np.concatenate((pc1, red_color), axis=1)
-        pc2_color = np.concatenate((pc2, blue_color), axis=1)
-        pc1_pc2 = np.concatenate((pc1_color, pc2_color), axis=0)
+        # red_color = np.zeros_like(pc1)
+        # red_color[:, :] = [255, 0, 0]
+        # blue_color = np.zeros_like(pc2)
+        # blue_color[:, :] = [0, 0, 255]
+        # pc1_color = np.concatenate((pc1, red_color), axis=1)
+        # pc2_color = np.concatenate((pc2, blue_color), axis=1)
+        # pc1_pc2 = np.concatenate((pc1_color, pc2_color), axis=0)
         
         pc1 = torch.from_numpy(pc1).unsqueeze(0)
         pc2 = torch.from_numpy(pc2).unsqueeze(0)
@@ -495,13 +495,15 @@ def optimize_neural_prior(options, data_loader):
         
         logging.info(f"# {i} Working on sample: {cur_data_path}...")
         
-        colors_flow, info_dict = solver(pc1, pc2, options, net, options.iters)
-        colors_flow = np.concatenate((pc1.squeeze(dim=0).numpy(), colors_flow), axis=1)
+        info_dict = solver(pc1, pc2, options, net, options.iters)
+        save_path = cur_data_path.replace('velodyne', 'flow')[:-3] + 'npy'
+        np.save(save_path, info_dict['final_flow'][0].detach().cpu().numpy())
+        # colors_flow = np.concatenate((pc1.squeeze(dim=0).numpy(), colors_flow), axis=1)
         
-        if i % 100 == 0:
-            save_path = 'scan_add/00/' + cur_data_path[-10:-4]
-            np.savetxt(save_path + '.txt', pc1_pc2)
-            np.savetxt(save_path + '_flow.txt', colors_flow)
+        # if i % 100 == 0:
+        #     save_path = 'scan_add/00/' + cur_data_path[-10:-4]
+        #     np.savetxt(save_path + '.txt', pc1_pc2)
+        #     np.savetxt(save_path + '_flow.txt', colors_flow)
 
         # Collect results.
         outputs.append(dict(list(info_dict.items())[1:]))
@@ -578,4 +580,4 @@ if __name__ == "__main__":
         data_loader = SemKITTI_sk_multiscan('/mnt/Disk16T/chenhr/semantic_kitti/sequences/' + str(i).zfill(2))
 
         optimize_neural_prior(options, data_loader)
-        break
+        # break
